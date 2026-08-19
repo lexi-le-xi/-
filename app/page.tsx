@@ -1,215 +1,178 @@
 "use client";
 
+import * as THREE from "three";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type RoleKey = "gunner" | "assault" | "sniper";
-type Phase = "intro" | "briefing" | "march" | "battle" | "quiz" | "result";
+type Phase = "intro" | "scout" | "question" | "map" | "march" | "torch" | "battle" | "won" | "lost" | "level2Intro" | "chishuiMap" | "chishuiQuiz" | "diversion" | "escape" | "level2Won" | "level2Lost";
+type Vec = { x: number; z: number };
 
-const ROLES: Record<RoleKey, { name: string; tag: string; desc: string; ammo: number; damage: number; cooldown: number; color: string }> = {
-  gunner: { name: "机枪兵", tag: "持续压制", desc: "弹量充足，持续射击可为突击队建立安全窗口。", ammo: 64, damage: 1, cooldown: 120, color: "#d5a23b" },
-  assault: { name: "冲锋兵", tag: "快速突破", desc: "射速和威力均衡，靠近桥头时推进效率最高。", ammo: 42, damage: 2, cooldown: 260, color: "#c44d35" },
-  sniper: { name: "狙击手", tag: "精准清除", desc: "弹药有限，但可远距离一击清除高威胁火力点。", ammo: 18, damage: 4, cooldown: 720, color: "#6d8d77" },
-};
+const BOARD_COUNT = 20;
+const BOARD_STEP = 1.55;
+const BRIDGE_START = 8;
+const ENEMY_POSITIONS: Vec[] = Array.from({length:15},(_,i)=>({x:-7+(i%5)*3.5,z:-25-Math.floor(i/5)*2.4}));
+const ESCAPE_PURSUER_START: Vec[] = [{x:-32,z:0},{x:32,z:0},{x:0,z:32},{x:-32,z:32}];
 
-const MARCH_EVENTS = [
-  { title: "暴雨中的岔路", text: "河岸近路有敌军哨点；山路更隐蔽，却会消耗更多体力。", options: [{ label: "侦察后沿河快速穿插", time: 5, stamina: 8, note: "利用速度抢在哨点合围前通过。" }, { label: "翻越山岭完全避战", time: 12, stamina: 18, note: "安全，但失去宝贵时间。" }] },
-  { title: "队伍出现掉队", text: "连续行军后，数名战士体力不支。你必须在速度与队伍完整之间平衡。", options: [{ label: "重分配负重，保持队形", time: 7, stamina: 6, note: "协作比抛下队友更可靠。" }, { label: "原地长时间休整", time: 16, stamina: -12, note: "恢复充分，但夺桥窗口正在缩小。" }] },
-  { title: "前方小股阻击", text: "对方尚未完成部署。纠缠越久，泸定桥守备越充分。", options: [{ label: "火力掩护，小组交替前进", time: 6, stamina: 10, note: "用协同换取时间。" }, { label: "展开全面攻击", time: 15, stamina: 8, note: "消灭更多敌人并非本次任务的核心。" }] },
-];
-
-const QUESTIONS = [
-  { q: "为什么不能只依靠安顺场的渡船？", choices: ["船只少、运力不足，追兵又在逼近", "大渡河已经完全封冻", "泸定桥离目的地更远"], a: 0 },
-  { q: "泸定桥的13根铁链如何分布？", choices: ["13根全部铺在桥面", "9根承托桥面，4根形成两侧护栏", "7根桥面，6根护栏"], a: 1 },
-  { q: "“飞夺”中的“飞”首先体现了什么？", choices: ["战士从空中降落", "只依靠正面火力", "急行军与敌军争夺时间"], a: 2 },
-];
-
-function randomRole(): RoleKey {
-  return (["gunner", "assault", "sniper"] as RoleKey[])[Math.floor(Math.random() * 3)];
+function makeAudio() {
+  const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const ctx = new AudioCtx();
+  const master = ctx.createGain(); master.gain.value = .13; master.connect(ctx.destination);
+  const drone = ctx.createOscillator(); const droneGain = ctx.createGain();
+  drone.type = "sine"; drone.frequency.value = 55; droneGain.gain.value = .22;
+  drone.connect(droneGain).connect(master); drone.start();
+  let beat = 0;
+  const timer = window.setInterval(() => {
+    const osc = ctx.createOscillator(); const gain = ctx.createGain();
+    osc.type = beat % 4 === 0 ? "triangle" : "sine"; osc.frequency.value = [110,147,165,147][beat%4];
+    gain.gain.setValueAtTime(.001,ctx.currentTime); gain.gain.exponentialRampToValueAtTime(.22,ctx.currentTime+.02); gain.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.32);
+    osc.connect(gain).connect(master); osc.start(); osc.stop(ctx.currentTime+.35); beat++;
+  }, 620);
+  return { stop: () => { window.clearInterval(timer); drone.stop(); ctx.close(); } };
 }
 
-export default function Home() {
-  const [phase, setPhase] = useState<Phase>("intro");
-  const [role, setRole] = useState<RoleKey>("assault");
-  const [revealing, setRevealing] = useState(false);
-  const [time, setTime] = useState(120);
-  const [stamina, setStamina] = useState(100);
-  const [marchIndex, setMarchIndex] = useState(0);
-  const [marchNote, setMarchNote] = useState("");
-  const [progress, setProgress] = useState(0);
-  const [ammo, setAmmo] = useState(42);
-  const [enemies, setEnemies] = useState<{ id: number; x: number; y: number; hp: number; type: "rifle" | "nest" }[]>([]);
-  const [battleTime, setBattleTime] = useState(50);
-  const [lastShot, setLastShot] = useState(0);
-  const [quizIndex, setQuizIndex] = useState(0);
-  const [quizScore, setQuizScore] = useState(0);
-  const [feedback, setFeedback] = useState("");
-  const [hits, setHits] = useState(0);
-  const enemyId = useRef(0);
+function World3D({ phase, player, boards, warning, enemyAlive, laying, shotFlash }:{phase:Phase;player:Vec;boards:number;warning:Vec|null;enemyAlive:boolean[];laying:boolean;shotFlash:number}) {
+  const mount = useRef<HTMLDivElement>(null);
+  const values = useRef({phase,player,boards,warning,enemyAlive,laying,shotFlash});
+  values.current={phase,player,boards,warning,enemyAlive,laying,shotFlash};
+  useEffect(()=>{
+    if(!mount.current) return;
+    const host=mount.current, scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x171c1c); scene.fog=new THREE.FogExp2(0x263332,.021);
+    const camera=new THREE.PerspectiveCamera(58,host.clientWidth/host.clientHeight,.1,300);
+    const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio,1.6)); renderer.setSize(host.clientWidth,host.clientHeight); renderer.shadowMap.enabled=true; host.appendChild(renderer.domElement);
+    scene.add(new THREE.HemisphereLight(0xb7c6ba,0x33271e,1.8)); const sun=new THREE.DirectionalLight(0xf2bc76,2.4);sun.position.set(-16,25,12);sun.castShadow=true;scene.add(sun);
+    const river=new THREE.Mesh(new THREE.PlaneGeometry(36,110,28,28),new THREE.MeshStandardMaterial({color:0x284c52,roughness:.35,metalness:.15,wireframe:false}));river.rotation.x=-Math.PI/2;river.position.set(0,-5,-15);scene.add(river);
+    const mountainMat=new THREE.MeshStandardMaterial({color:0x3b4439,roughness:1});
+    for(let i=0;i<18;i++){const m=new THREE.Mesh(new THREE.ConeGeometry(8+Math.random()*8,18+Math.random()*24,5),mountainMat);m.position.set((i%2?1:-1)*(13+Math.random()*18),3,-40+Math.random()*85);m.rotation.y=Math.random();scene.add(m)}
+    const towerMat=new THREE.MeshStandardMaterial({color:0x44382b});
+    [-1,1].forEach(side=>{const tower=new THREE.Mesh(new THREE.BoxGeometry(9,10,5),towerMat);tower.position.set(0,0,side===1?22:-32);scene.add(tower);const roof=new THREE.Mesh(new THREE.ConeGeometry(7,3,4),new THREE.MeshStandardMaterial({color:0x251e18}));roof.rotation.y=Math.PI/4;roof.position.set(0,6,side===1?22:-32);scene.add(roof)});
+    const chainMat=new THREE.MeshStandardMaterial({color:0x191816,metalness:.8,roughness:.42});
+    Array.from({length:9},(_,i)=>-4+i).forEach(x=>{const chain=new THREE.Mesh(new THREE.CylinderGeometry(.11,.11,40,8),chainMat);chain.rotation.x=Math.PI/2;chain.position.set(x,-1,-7);scene.add(chain)});
+    [[-4.65,.45],[-4.65,1.25],[4.65,.45],[4.65,1.25]].forEach(([x,y])=>{const rail=new THREE.Mesh(new THREE.CylinderGeometry(.1,.1,40,8),chainMat);rail.rotation.x=Math.PI/2;rail.position.set(x,y,-7);scene.add(rail)});
+    const boardMat=new THREE.MeshStandardMaterial({color:0x745033,roughness:1}); const boardMeshes:THREE.Mesh[]=[];
+    for(let i=0;i<BOARD_COUNT;i++){const b=new THREE.Mesh(new THREE.BoxGeometry(8.1,.25,1.18),boardMat);b.position.set(0,-.72,BRIDGE_START-i*BOARD_STEP);b.castShadow=true;scene.add(b);boardMeshes.push(b)}
+    const playerGroup=new THREE.Group(); const body=new THREE.Mesh(new THREE.CapsuleGeometry(.62,1.4,4,8),new THREE.MeshStandardMaterial({color:0x7e9a5c,emissive:0x263917,emissiveIntensity:.8}));body.position.y=.35;playerGroup.add(body);const head=new THREE.Mesh(new THREE.SphereGeometry(.43,12,8),new THREE.MeshStandardMaterial({color:0xd2a279}));head.position.y=1.65;playerGroup.add(head);const gun=new THREE.Mesh(new THREE.BoxGeometry(.17,.17,1.8),new THREE.MeshStandardMaterial({color:0x24231f}));gun.position.set(.4,.82,-.82);playerGroup.add(gun);const playerArrow=new THREE.Mesh(new THREE.ConeGeometry(.34,.75,8),new THREE.MeshBasicMaterial({color:0xf5d36b}));playerArrow.rotation.x=Math.PI;playerArrow.position.y=3;playerGroup.add(playerArrow);const playerRing=new THREE.Mesh(new THREE.RingGeometry(.7,1,24),new THREE.MeshBasicMaterial({color:0xf5d36b,side:THREE.DoubleSide}));playerRing.rotation.x=-Math.PI/2;playerRing.position.y=-.35;playerGroup.add(playerRing);scene.add(playerGroup);
+    const enemies:THREE.Group[]=[];ENEMY_POSITIONS.forEach((p,i)=>{const g=new THREE.Group();const b=new THREE.Mesh(new THREE.BoxGeometry(1.25,1.65,.95),new THREE.MeshStandardMaterial({color:0x9b4939,emissive:0x4b120d,emissiveIntensity:1.3}));b.position.y=.3;g.add(b);const h=new THREE.Mesh(new THREE.SphereGeometry(.4,10,8),new THREE.MeshStandardMaterial({color:0xd19a71}));h.position.y=1.55;g.add(h);const badge=new THREE.Mesh(new THREE.ConeGeometry(.22,.55,8),new THREE.MeshBasicMaterial({color:0xff4b35}));badge.rotation.x=Math.PI;badge.position.y=2.7;g.add(badge);g.position.set(p.x,0,p.z);g.scale.setScalar(i<5?1.1:1);scene.add(g);enemies.push(g)});
+    const marker=new THREE.Mesh(new THREE.RingGeometry(.45,1.05,32),new THREE.MeshBasicMaterial({color:0xff1708,side:THREE.DoubleSide,depthTest:false}));marker.rotation.x=-Math.PI/2;marker.position.y=.05;marker.renderOrder=20;scene.add(marker);const warningBeam=new THREE.Mesh(new THREE.CylinderGeometry(.12,.65,5,16,1,true),new THREE.MeshBasicMaterial({color:0xff1708,transparent:true,opacity:.45,depthTest:false,side:THREE.DoubleSide}));warningBeam.position.y=2.2;warningBeam.renderOrder=19;scene.add(warningBeam);
+    const tracerMat=new THREE.LineBasicMaterial({color:0xffd28a});const tracerGeo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]);const tracer=new THREE.Line(tracerGeo,tracerMat);scene.add(tracer);
+    const clock=new THREE.Clock(); let raf=0;
+    const render=()=>{const v=values.current,t=clock.getElapsedTime();
+      boardMeshes.forEach((b,i)=>{b.visible=i<v.boards;b.position.y=-.72+(i===v.boards-1?Math.sin(t*12)*.03:0)});
+      playerGroup.position.set(v.player.x,0,v.player.z);playerGroup.rotation.y=v.laying?Math.sin(t*8)*.12:0;
+      enemies.forEach((e,i)=>{e.visible=v.enemyAlive[i];e.position.y=Math.sin(t*1.8+i)*.08});
+      marker.visible=!!v.warning;warningBeam.visible=!!v.warning;if(v.warning){marker.position.x=v.warning.x;marker.position.z=v.warning.z;warningBeam.position.x=v.warning.x;warningBeam.position.z=v.warning.z;marker.scale.setScalar(1+Math.sin(t*10)*.25);warningBeam.material instanceof THREE.MeshBasicMaterial&&(warningBeam.material.opacity=.28+.22*Math.abs(Math.sin(t*9)))}
+      const nearest=ENEMY_POSITIONS.find((_,i)=>v.enemyAlive[i]);tracer.visible=Date.now()-v.shotFlash<110&&!!nearest;if(nearest){const pos=tracer.geometry.attributes.position as THREE.BufferAttribute;pos.setXYZ(0,v.player.x,.7,v.player.z);pos.setXYZ(1,nearest.x,.7,nearest.z);pos.needsUpdate=true}
+      if(v.phase==="scout"||v.phase==="question"){camera.position.set(Math.sin(t*.11)*23,15,22+Math.cos(t*.11)*12);camera.lookAt(0,-1,-8)}else if(v.phase==="march"||v.phase==="torch"){camera.position.set(Math.sin(t*.16)*12,7,playerGroup.position.z+14);camera.lookAt(0,0,playerGroup.position.z-8)}else{camera.position.lerp(new THREE.Vector3(v.player.x,6.4,v.player.z+6.5),.16);camera.lookAt(v.player.x,0.8,v.player.z-13)}
+      river.material instanceof THREE.MeshStandardMaterial&&(river.material.emissiveIntensity=.08+.05*Math.sin(t));renderer.render(scene,camera);raf=requestAnimationFrame(render)};render();
+    const resize=()=>{camera.aspect=host.clientWidth/host.clientHeight;camera.updateProjectionMatrix();renderer.setSize(host.clientWidth,host.clientHeight)};window.addEventListener("resize",resize);
+    return()=>{cancelAnimationFrame(raf);window.removeEventListener("resize",resize);renderer.dispose();host.removeChild(renderer.domElement)};
+  },[]);
+  return <div ref={mount} className="world3d"/>;
+}
 
-  const begin = () => {
-    setRevealing(true);
-    let rolls = 0;
-    const timer = window.setInterval(() => {
-      setRole(randomRole());
-      rolls += 1;
-      if (rolls > 12) {
-        window.clearInterval(timer);
-        const next = randomRole();
-        setRole(next);
-        setAmmo(ROLES[next].ammo);
-        setRevealing(false);
-        setPhase("briefing");
-      }
-    }, 90);
-  };
+function RouteMap({onComplete}:{onComplete:(route:string)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null);const points=useRef<{x:number;y:number}[]>([]);const drawing=useRef(false);const showCorrect=useRef(false);const [message,setMessage]=useState("从安顺场按住鼠标左键，画到泸定城");const [result,setResult]=useState<{choice:string;correct:boolean}|null>(null);
+  const paint=useCallback(()=>{const el=canvas.current;if(!el)return;const rect=el.getBoundingClientRect(),dpr=Math.min(devicePixelRatio,2);if(el.width!==rect.width*dpr||el.height!==rect.height*dpr){el.width=rect.width*dpr;el.height=rect.height*dpr}const c=el.getContext("2d");if(!c)return;c.setTransform(dpr,0,0,dpr,0,0);const w=rect.width,h=rect.height;c.clearRect(0,0,w,h);c.fillStyle="#d7caa8";c.fillRect(0,0,w,h);
+    c.strokeStyle="#8e8268";c.globalAlpha=.28;c.lineWidth=1;for(let i=0;i<12;i++){c.beginPath();for(let x=0;x<w;x+=12){const y=h*(.08+i*.075)+Math.sin(x*.018+i)*17;if(x===0)c.moveTo(x,y);else c.lineTo(x,y)}c.stroke()}c.globalAlpha=1;
+    c.strokeStyle="#315e68";c.lineWidth=22;c.lineCap="round";c.beginPath();c.moveTo(w*.5,h*.96);c.bezierCurveTo(w*.39,h*.72,w*.62,h*.54,w*.5,h*.32);c.bezierCurveTo(w*.43,h*.23,w*.55,h*.16,w*.5,h*.05);c.stroke();c.strokeStyle="#78a7ad";c.lineWidth=4;c.stroke();
+    const route=(arr:[number,number][],color:string)=>{c.save();c.setLineDash([7,8]);c.strokeStyle=color;c.lineWidth=3;c.beginPath();arr.forEach(([x,y],i)=>i?c.lineTo(w*x,h*y):c.moveTo(w*x,h*y));c.stroke();c.restore()};
+    route([[.47,.88],[.34,.72],[.38,.51],[.42,.31],[.48,.12]],"#9b3d2e");route([[.54,.88],[.64,.7],[.6,.52],[.63,.34],[.52,.12]],"#495f36");route([[.47,.88],[.2,.68],[.22,.42],[.36,.19],[.48,.12]],"#7a6748");if(showCorrect.current){c.save();c.setLineDash([]);c.strokeStyle="#e32920";c.lineWidth=9;c.shadowColor="#fff1a8";c.shadowBlur=12;c.beginPath();[[.47,.88],[.34,.72],[.38,.51],[.42,.31],[.48,.12]].forEach(([x,y],i)=>i?c.lineTo(w*x,h*y):c.moveTo(w*x,h*y));c.stroke();c.restore()}
+    const label=(x:number,y:number,title:string,sub?:string)=>{c.fillStyle="#201f1a";c.font="700 14px Arial";c.fillText(title,w*x,h*y);if(sub){c.fillStyle="#5f594b";c.font="11px Arial";c.fillText(sub,w*x,h*y+16)}};label(.52,.91,"安顺场渡口","起点 · 船只有限");label(.53,.1,"泸定桥 / 泸定城","目标 · 关键通道");label(.66,.51,"龙八铺","东岸交战节点");label(.04,.44,"高山绕行线","耗时长、体力消耗大");c.fillStyle="#315e68";c.font="700 12px Arial";c.fillText("大 渡 河",w*.49,h*.48);
+    const enemy=(x:number,y:number,text:string)=>{c.save();c.translate(w*x,h*y);c.rotate(Math.PI/4);c.fillStyle="#a62f25";c.fillRect(-7,-7,14,14);c.restore();c.fillStyle="#7d201b";c.font="700 11px Arial";c.fillText(text,w*x+13,h*y+4)};enemy(.69,.57,"敌军第4旅增援");enemy(.39,.6,"沿途阻击");enemy(.57,.18,"泸定城守军");
+    c.fillStyle="#9b3d2e";c.beginPath();c.arc(w*.5,h*.88,7,0,Math.PI*2);c.fill();c.fillStyle="#222";c.beginPath();c.arc(w*.5,h*.12,7,0,Math.PI*2);c.fill();
+    if(points.current.length){c.strokeStyle="#f0b43c";c.lineWidth=6;c.shadowColor="#0008";c.shadowBlur=7;c.beginPath();points.current.forEach((p,i)=>i?c.lineTo(p.x,p.y):c.moveTo(p.x,p.y));c.stroke();c.shadowBlur=0}
+  },[]);
+  useEffect(()=>{paint();const resize=()=>paint();window.addEventListener("resize",resize);return()=>window.removeEventListener("resize",resize)},[paint]);
+  const pos=(e:React.PointerEvent<HTMLCanvasElement>)=>{const r=e.currentTarget.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}};
+  const submit=useCallback(()=>{const el=canvas.current,p=points.current;if(result)return;if(!el||p.length<12){setMessage("路线太短，请从安顺场完整画到泸定城");return}const r=el.getBoundingClientRect(),start=p[0],end=p[p.length-1];if(Math.hypot(start.x-r.width*.5,start.y-r.height*.88)>80||Math.hypot(end.x-r.width*.5,end.y-r.height*.12)>90){setMessage("路线必须从安顺场出发，并抵达泸定城");return}const avg=p.reduce((s,v)=>s+v.x,0)/p.length,choice=avg<r.width*.42?"西侧山地绕行":avg>r.width*.56?"东岸路线（龙八铺敌军增援）":"沿大渡河西岸急行";showCorrect.current=true;setResult({choice,correct:choice==="沿大渡河西岸急行"});paint()},[paint,result]);
+  useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.key.toLowerCase()==="w"){e.preventDefault();submit()}if(e.code==="Space"&&!result){e.preventDefault();points.current=[];drawing.current=false;setMessage("已清空，请从安顺场重新勾画");paint()}};window.addEventListener("keydown",key);return()=>window.removeEventListener("keydown",key)},[submit,paint,result]);
+  return <section className="map-stage"><canvas ref={canvas} onPointerDown={e=>{if(result)return;drawing.current=true;points.current.push(pos(e));e.currentTarget.setPointerCapture(e.pointerId);paint()}} onPointerMove={e=>{if(drawing.current&&!result){points.current.push(pos(e));paint()}}} onPointerUp={()=>{drawing.current=false;setMessage("绘制已暂停；可继续按住左键续画，按空格清空重画")}}/><div className="map-head"><p className="kicker">地理任务 · 安顺场至泸定城</p><h2>在历史地形上规划北进路线</h2><span>北 ↑ · 历史地理示意图，非现代导航地图</span></div><div className="map-legend"><b>路线图例</b><span className="west">西岸红四团方向</span><span className="east">东岸红一师方向</span><span className="enemy-key">敌军与阻击节点</span></div><div className="draw-tip"><b>{message}</b><span><kbd>鼠标左键</kbd> 按住/松开暂停　<kbd>空格</kbd> 重画　<kbd>W</kbd> 提交</span></div>{result&&<div className="route-result"><p className="kicker">系统路线判定</p><h3>{result.correct?"路线正确":"建议修正路线"}</h3><p>你的选择：<b>{result.choice}</b></p><p>正确路线是图中高亮的<b>大渡河西岸路线</b>。红四团的任务是从安顺场沿西岸向泸定桥高速奔袭；东岸由红一师和干部团推进，并在龙八铺方向牵制敌军增援。选择西岸可避免把两支部队的历史任务混淆，同时直达泸定桥西桥头。</p><button onClick={()=>onComplete(result.choice)}>理解路线，继续急行</button></div>}</section>
+}
 
-  const resetGame = () => {
-    setPhase("intro"); setTime(120); setStamina(100); setMarchIndex(0); setMarchNote("");
-    setProgress(0); setEnemies([]); setBattleTime(50); setQuizIndex(0); setQuizScore(0); setFeedback(""); setHits(0);
-  };
+function ChishuiMap({onComplete}:{onComplete:()=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null),points=useRef<{x:number;y:number}[]>([]),drawing=useRef(false),showAnswer=useRef(false);
+  const [note,setNote]=useState("从土城出发，依次经过 1—4 号渡口，最后指向乌江");
+  const [submitted,setSubmitted]=useState(false);const [matched,setMatched]=useState(0);
+  const paint=useCallback(()=>{const el=canvas.current;if(!el)return;const r=el.getBoundingClientRect(),d=Math.min(devicePixelRatio,2);el.width=r.width*d;el.height=r.height*d;const c=el.getContext("2d");if(!c)return;c.setTransform(d,0,0,d,0,0);const w=r.width,h=r.height;c.clearRect(0,0,w,h);c.fillStyle="#d8cba8";c.fillRect(0,0,w,h);
+    c.fillStyle="#d3c49d";c.beginPath();c.moveTo(0,0);c.lineTo(w*.47,0);c.bezierCurveTo(w*.4,h*.28,w*.48,h*.58,w*.45,h);c.lineTo(0,h);c.fill();c.fillStyle="#dccfaa";c.beginPath();c.moveTo(w*.47,0);c.lineTo(w,h*0);c.lineTo(w,h);c.lineTo(w*.45,h);c.bezierCurveTo(w*.48,h*.58,w*.4,h*.28,w*.47,0);c.fill();
+    c.strokeStyle="#8f846b55";c.lineWidth=1;for(let i=0;i<13;i++){c.beginPath();for(let x=0;x<w;x+=10){const y=h*(.06+i*.075)+Math.sin(x*.018+i)*12;x?c.lineTo(x,y):c.moveTo(x,y)}c.stroke()}
+    c.save();c.setLineDash([8,8]);c.strokeStyle="#8b795c88";c.lineWidth=2;c.beginPath();c.moveTo(w*.06,h*.58);c.bezierCurveTo(w*.3,h*.5,w*.29,h*.73,w*.46,h*.77);c.stroke();c.beginPath();c.moveTo(w*.54,h*.08);c.bezierCurveTo(w*.72,h*.28,w*.62,h*.58,w*.91,h*.72);c.stroke();c.restore();
+    c.fillStyle="#75684f";c.font="700 13px Arial";c.fillText("四川",w*.2,h*.12);c.fillText("贵州",w*.75,h*.14);c.fillText("云南",w*.12,h*.78);
+    c.strokeStyle="#326772";c.lineWidth=24;c.lineCap="round";c.beginPath();c.moveTo(w*.46,h*.04);c.bezierCurveTo(w*.54,h*.2,w*.42,h*.32,w*.49,h*.45);c.bezierCurveTo(w*.58,h*.61,w*.45,h*.75,w*.52,h*.96);c.stroke();c.strokeStyle="#79a5a9";c.lineWidth=3;c.stroke();c.fillStyle="#234f58";c.font="700 12px Arial";c.fillText("赤 水 河",w*.505,h*.57);
+    const phases:{color:string;name:string;path:[number,number][]}[]=[
+      {color:"#d63b2d",name:"一渡",path:[[.55,.28],[.47,.28],[.33,.31],[.15,.47]]},
+      {color:"#dd8b22",name:"二渡",path:[[.15,.47],[.31,.39],[.49,.42],[.67,.39],[.76,.48]]},
+      {color:"#61853b",name:"三渡",path:[[.76,.48],[.65,.58],[.53,.66],[.4,.62],[.31,.51]]},
+      {color:"#79539b",name:"四渡",path:[[.31,.51],[.39,.45],[.5,.43],[.65,.49],[.78,.82]]}
+    ];
+    const arrow=(a:[number,number],b:[number,number],color:string)=>{const ax=w*a[0],ay=h*a[1],bx=w*b[0],by=h*b[1],ang=Math.atan2(by-ay,bx-ax);c.save();c.translate(bx,by);c.rotate(ang);c.fillStyle=color;c.beginPath();c.moveTo(0,0);c.lineTo(-12,-6);c.lineTo(-12,6);c.closePath();c.fill();c.restore()};
+    if(showAnswer.current)phases.forEach(p=>{c.strokeStyle=p.color;c.lineWidth=7;c.lineJoin="round";c.beginPath();p.path.forEach(([x,y],i)=>i?c.lineTo(w*x,h*y):c.moveTo(w*x,h*y));c.stroke();arrow(p.path[p.path.length-2],p.path[p.path.length-1],p.color)});
+    const label=(x:number,y:number,title:string,sub?:string)=>{c.fillStyle="#24231d";c.font="700 13px Arial";c.fillText(title,w*x,h*y);if(sub){c.fillStyle="#625b4c";c.font="11px Arial";c.fillText(sub,w*x,h*y+15)}};
+    label(.56,.265,"土城","青杠坡战斗后转向");label(.39,.245,"元厚");label(.09,.49,"扎西","整编并决定回师东进");label(.51,.405,"太平渡、二郎滩");label(.77,.465,"遵义");label(.73,.355,"娄山关");label(.555,.69,"茅台");label(.27,.54,"古蔺");label(.79,.85,"乌江方向","跳出合围");
+    const enemy=(x:number,y:number,text:string)=>{c.fillStyle="#a62f25";c.fillRect(w*x-6,h*y-6,12,12);c.font="700 11px Arial";c.fillText(text,w*x+10,h*y+4)};enemy(.27,.22,"川军");enemy(.7,.28,"中央军");enemy(.68,.55,"黔军");enemy(.23,.7,"滇军");
+    const crossings:[number,number,string,string][]=[[.47,.28,"1","1月29日"],[.49,.42,"2","2月18—21日"],[.53,.66,"3","3月16—17日"],[.5,.43,"4","3月21—22日"]];crossings.forEach(([x,y,n,date])=>{c.fillStyle=showAnswer.current?phases[Number(n)-1].color:"#af3026";c.beginPath();c.arc(w*x,h*y,13,0,Math.PI*2);c.fill();c.strokeStyle="#f5e5bd";c.lineWidth=2;c.stroke();c.fillStyle="white";c.font="700 12px Arial";c.fillText(n,w*x-3.5,h*y+4);c.fillStyle="#4f493d";c.font="10px Arial";c.fillText(date,w*x+17,h*y-7)});
+    c.fillStyle="#2b2a23";c.font="700 12px Arial";c.fillText("北",w*.93,h*.09);c.beginPath();c.moveTo(w*.94,h*.035);c.lineTo(w*.928,h*.07);c.lineTo(w*.952,h*.07);c.closePath();c.fill();
+    c.fillStyle="#8e3b31";c.fillRect(w*.72,h*.075,10,10);c.fillStyle="#3f3b32";c.font="11px Arial";c.fillText("敌军大致集结方向（随战局变化）",w*.72+16,h*.075+9);
+    if(points.current.length){c.strokeStyle="#f5bd38";c.lineWidth=6;c.lineJoin="round";c.shadowColor="#46341199";c.shadowBlur=5;c.beginPath();points.current.forEach((p,i)=>i?c.lineTo(p.x,p.y):c.moveTo(p.x,p.y));c.stroke();c.shadowBlur=0}
+  },[]);
+  useEffect(()=>{paint();const f=()=>paint();addEventListener("resize",f);return()=>removeEventListener("resize",f)},[paint]);
+  const pos=(e:React.PointerEvent<HTMLCanvasElement>)=>{const r=e.currentTarget.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}};
+  const submit=useCallback(()=>{const el=canvas.current;if(!el||points.current.length<20){setNote("路线过短，请从土城完整勾画到乌江方向");return}const r=el.getBoundingClientRect(),targets:[[number,number],[number,number],[number,number],[number,number]]=[[.47,.28],[.49,.42],[.53,.66],[.5,.43]];let from=0,count=0;for(const [tx,ty] of targets){const found=points.current.findIndex((p,i)=>i>=from&&Math.hypot(p.x-r.width*tx,p.y-r.height*ty)<70);if(found<0)break;count++;from=found+1}setMatched(count);showAnswer.current=true;setSubmitted(true);paint()},[paint]);
+  useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.key.toLowerCase()==="w"&&!submitted){e.preventDefault();submit()}if(e.code==="Space"&&!submitted){e.preventDefault();points.current=[];drawing.current=false;setNote("路线已清空，请从土城重新勾画");paint()}};addEventListener("keydown",key);return()=>removeEventListener("keydown",key)},[paint,submit,submitted]);
+  return <section className="map-stage chishui-map"><canvas ref={canvas} onPointerDown={e=>{if(submitted)return;drawing.current=true;points.current.push(pos(e));e.currentTarget.setPointerCapture(e.pointerId);paint()}} onPointerMove={e=>{if(drawing.current&&!submitted){points.current.push(pos(e));paint()}}} onPointerUp={()=>{drawing.current=false;setNote("绘制已暂停，可继续勾画；按 W 提交，空格重画")}}/><div className="map-head"><p className="kicker">第二关 · 四渡赤水</p><h2>勾画四次渡河路线</h2><span>北 ↑ · 1935年1月末—3月下旬 · 川滇黔边历史地理教学图</span></div><div className="draw-tip"><b>{note}</b><span><kbd>鼠标左键</kbd> 勾画　<kbd>空格</kbd> 重画　<kbd>W</kbd> 提交</span></div>{submitted&&<div className="route-result chishui-result"><p className="kicker">系统路线解析 · 经过 {matched}/4 个渡口</p><h3>{matched===4?"顺序正确：四渡形成往复机动":"对照彩色路线修正你的判断"}</h3><div className="crossing-lessons"><p><b>一渡 · 1月29日</b><span>土城、元厚向西进入川南：土城战斗不利，避开优势敌军。</span></p><p><b>二渡 · 2月18—21日</b><span>太平渡、二郎滩向东重返贵州：利用黔北空虚，夺取娄山关、遵义。</span></p><p><b>三渡 · 3月16—17日</b><span>茅台向西再入川南：佯示北渡长江，诱使敌军主力西调。</span></p><p><b>四渡 · 3月21—22日</b><span>太平渡、二郎滩一带向东：乘隙穿插，随后南渡乌江跳出合围。</span></p></div><button onClick={onComplete}>理解路线，进入战略判断</button></div>}</section>
+}
 
-  const chooseRoute = (correct: boolean) => {
-    setTime(correct ? 120 : 102);
-    setFeedback(correct ? "判断正确：泸定桥是大部队迅速渡河的关键通道。" : "这会拖慢全军。安顺场船只有限，必须争夺上游的泸定桥。");
-    window.setTimeout(() => { setFeedback(""); setPhase("march"); }, 1700);
-  };
+const DIVERSION_TASKS=[
+  {title:"布置假营火",desc:"制造大部队准备北进的迹象",shift:28},
+  {title:"释放误导电报",desc:"让敌军判断红军将向长江方向行动",shift:34},
+  {title:"派出佯动小队",desc:"把川南方向的侦察与增援部队吸走",shift:30},
+  {title:"留下行军痕迹",desc:"加强西进、北渡的假象",shift:24}
+];
+const CHISHUI_DECISIONS=[
+  {stage:"一渡 · 土城转向",intel:"土城战斗不利，北渡长江的道路受阻。",question:"此时应如何保存主动？",correct:"从土城、元厚向西渡过赤水，避开优势敌军",wrong:"继续强攻北进，不改变原计划",explain:"根据战场变化立即转向，一渡不是退却，而是避免被优势敌军钉死。"},
+  {stage:"二渡 · 回师黔北",intel:"敌军主力被吸引到川南，黔北防守出现空隙。",question:"下一步最有利的行动是什么？",correct:"由太平渡、二郎滩向东回师，抢占娄山关和遵义",wrong:"继续向川西深处行军",explain:"二渡利用敌军调动后的薄弱处突然回师，形成局部主动。"},
+  {stage:"三渡 · 茅台佯动",intel:"遵义战役后敌军重新压来，鲁班场方向难以突破。",question:"三渡赤水应当制造什么判断？",correct:"从茅台向西渡河，佯示准备北渡长江",wrong:"在川南建立固定阵地长期防守",explain:"三渡的价值在于制造假方向，把敌军主力继续调向川南。"},
+  {stage:"四渡 · 乘隙穿插",intel:"佯动奏效，敌军主力已经西调，东侧封锁尚未闭合。",question:"怎样把调动敌军转化为突围机会？",correct:"秘密向东四渡赤水，随后南渡乌江",wrong:"继续向北公开行军，等待敌军合围",explain:"四渡利用敌军部署变化突然折返，从尚未闭合的缝隙中穿过。"}
+];
 
-  const marchChoice = (option: typeof MARCH_EVENTS[number]["options"][number]) => {
-    setTime(v => Math.max(0, v - option.time));
-    setStamina(v => Math.max(12, Math.min(100, v - option.stamina)));
-    setMarchNote(option.note);
-    window.setTimeout(() => {
-      setMarchNote("");
-      if (marchIndex === MARCH_EVENTS.length - 1) setPhase("battle");
-      else setMarchIndex(v => v + 1);
-    }, 1250);
-  };
+function DiversionMission({onComplete}:{onComplete:()=>void}){
+  const [done,setDone]=useState<number[]>([]);const shift=done.reduce((n,i)=>n+DIVERSION_TASKS[i].shift,0);
+  return <section className="overlay diversion"><p className="kicker">三渡赤水 · 佯动任务</p><h1>让敌军<br/><em>看见假方向</em></h1><p>三渡并非准备长期固守川南。完成三项佯动，让敌军主力错误西调，为四渡创造空隙。</p><div className="enemy-shift"><span>敌军西调程度</span><div><i style={{width:`${Math.min(100,shift)}%`}}/></div><b>{Math.min(100,shift)}%</b></div><div className="diversion-grid">{DIVERSION_TASKS.map((task,i)=><button key={task.title} className={done.includes(i)?"done":""} disabled={done.includes(i)||done.length>=3} onClick={()=>setDone(v=>[...v,i])}><small>{done.includes(i)?"✓ 已完成":"选择行动"}</small><b>{task.title}</b><span>{task.desc}</span></button>)}</div><button className="primary" disabled={done.length<3} onClick={onComplete}>{done.length<3?`还需完成 ${3-done.length} 项佯动`:`敌军已西调，秘密准备四渡 →`}</button></section>
+}
 
-  useEffect(() => {
-    if (phase !== "battle") return;
-    const tick = window.setInterval(() => {
-      setBattleTime(v => {
-        if (v <= 1) { setPhase("quiz"); return 0; }
-        return v - 1;
-      });
-      setProgress(v => {
-        const pressure = Math.max(0, 2.2 - enemies.length * 0.28);
-        const roleBoost = role === "gunner" ? 0.42 : role === "assault" && v > 55 ? 0.5 : 0;
-        const next = Math.min(100, v + pressure + roleBoost);
-        if (next >= 100) window.setTimeout(() => setPhase("quiz"), 200);
-        return next;
-      });
-    }, 1000);
-    return () => window.clearInterval(tick);
-  }, [phase, enemies.length, role]);
+function EscapeWorld({player,pursuers}:{player:Vec;pursuers:Vec[]}){const mount=useRef<HTMLDivElement>(null),values=useRef({player,pursuers});values.current={player,pursuers};useEffect(()=>{if(!mount.current)return;const host=mount.current,scene=new THREE.Scene();scene.background=new THREE.Color(0x202722);scene.fog=new THREE.Fog(0x202722,45,100);const camera=new THREE.PerspectiveCamera(52,host.clientWidth/host.clientHeight,.1,140),renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(host.clientWidth,host.clientHeight);renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));host.appendChild(renderer.domElement);scene.add(new THREE.HemisphereLight(0xd7cfb0,0x202820,2));const ground=new THREE.Mesh(new THREE.PlaneGeometry(90,90),new THREE.MeshStandardMaterial({color:0x4b5943}));ground.rotation.x=-Math.PI/2;scene.add(ground);const hero=new THREE.Mesh(new THREE.CapsuleGeometry(.55,1.2,4,8),new THREE.MeshStandardMaterial({color:0xc2d07b,emissive:0x31400e}));hero.position.y=1;scene.add(hero);const enemyColors=[0x6e3c2b,0xa4372c,0x7b3348,0x3c465c];const cubes=pursuers.map((_,i)=>{const m=new THREE.Mesh(new THREE.BoxGeometry(2.4,3.4,2.4),new THREE.MeshStandardMaterial({color:enemyColors[i],emissive:enemyColors[i],emissiveIntensity:.28}));m.position.y=1.7;scene.add(m);return m});for(let i=0;i<24;i++){const tree=new THREE.Group();const trunk=new THREE.Mesh(new THREE.CylinderGeometry(.18,.25,2.4,6),new THREE.MeshStandardMaterial({color:0x493a28}));trunk.position.y=1.2;tree.add(trunk);const crown=new THREE.Mesh(new THREE.ConeGeometry(1.25,3.5,7),new THREE.MeshStandardMaterial({color:0x283c2a}));crown.position.y=3.5;tree.add(crown);const angle=i*2.4,radius=8+(i%6)*5;tree.position.set(Math.cos(angle)*radius,0,Math.sin(angle)*radius);scene.add(tree)}const pole=new THREE.Mesh(new THREE.CylinderGeometry(.1,.1,5,8),new THREE.MeshStandardMaterial({color:0x28231b}));pole.position.set(13,2.5,-13);scene.add(pole);const flag=new THREE.Mesh(new THREE.PlaneGeometry(3,1.8),new THREE.MeshBasicMaterial({color:0xe12f24,side:THREE.DoubleSide}));flag.position.set(14.5,4,-13);scene.add(flag);let raf=0;const loop=()=>{const v=values.current;hero.position.x=v.player.x;hero.position.z=v.player.z;cubes.forEach((m,i)=>{m.position.x=v.pursuers[i].x;m.position.z=v.pursuers[i].z;m.rotation.y=Math.atan2(v.player.x-m.position.x,v.player.z-m.position.z)});camera.position.lerp(new THREE.Vector3(v.player.x+20,34,v.player.z+29),.08);camera.lookAt(v.player.x,0,v.player.z-2);renderer.render(scene,camera);raf=requestAnimationFrame(loop)};loop();const resize=()=>{camera.aspect=host.clientWidth/host.clientHeight;camera.updateProjectionMatrix();renderer.setSize(host.clientWidth,host.clientHeight)};addEventListener("resize",resize);return()=>{cancelAnimationFrame(raf);removeEventListener("resize",resize);renderer.dispose();host.removeChild(renderer.domElement)}},[]);return <div ref={mount} className="world3d escape-world"/>}
 
-  useEffect(() => {
-    if (phase !== "battle") return;
-    const spawn = window.setInterval(() => {
-      setEnemies(old => {
-        if (old.length >= 6) return old;
-        const type = Math.random() > 0.72 ? "nest" : "rifle";
-        return [...old, { id: enemyId.current++, x: 56 + Math.random() * 38, y: 18 + Math.random() * 56, hp: type === "nest" ? 4 : 2, type }];
-      });
-    }, role === "sniper" ? 1500 : 1150);
-    return () => window.clearInterval(spawn);
-  }, [phase, role]);
-
-  const shoot = useCallback((id: number) => {
-    const now = Date.now();
-    const r = ROLES[role];
-    if (ammo <= 0 || now - lastShot < r.cooldown) return;
-    setLastShot(now); setAmmo(v => v - 1);
-    setEnemies(old => old.flatMap(enemy => {
-      if (enemy.id !== id) return [enemy];
-      const damage = role === "sniper" && enemy.type === "nest" ? 5 : r.damage;
-      if (enemy.hp - damage <= 0) { setHits(v => v + 1); return []; }
-      return [{ ...enemy, hp: enemy.hp - damage }];
-    }));
-  }, [ammo, lastShot, role]);
-
-  const answer = (index: number) => {
-    const correct = index === QUESTIONS[quizIndex].a;
-    if (correct) setQuizScore(v => v + 1);
-    setFeedback(correct ? "正确" : `正确答案：${QUESTIONS[quizIndex].choices[QUESTIONS[quizIndex].a]}`);
-    window.setTimeout(() => {
-      setFeedback("");
-      if (quizIndex === QUESTIONS.length - 1) setPhase("result");
-      else setQuizIndex(v => v + 1);
-    }, 1050);
-  };
-
-  const r = ROLES[role];
-
-  return (
-    <main className="game-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark">泸</span><div><b>泸定 · 与时间赛跑</b><small>历史战术行动</small></div></div>
-        <div className="date">1935.05.29 <span>大渡河西岸</span></div>
-      </header>
-
-      {phase === "intro" && <section className="hero panel">
-        <div className="hero-copy">
-          <p className="eyebrow">任务代号 · 生命通道</p>
-          <h1>桥在前方，<br/><em>时间在身后。</em></h1>
-          <p className="lead">安顺场渡船运力不足，追兵正在逼近。你所在的红四团必须昼夜急行，抢在增援到达前控制泸定桥。</p>
-          <div className="facts"><span>约120公里急行军</span><span>13根铁链</span><span>22名突击队员</span></div>
-          <button className="primary" onClick={begin} disabled={revealing}>{revealing ? "正在编入战斗小组…" : "接受任务"}</button>
-          {revealing && <div className="role-roll" style={{ "--role": r.color } as React.CSSProperties}><small>随机分配</small><strong>{r.name}</strong><span>{r.tag}</span></div>}
-        </div>
-        <div className="bridge-art" aria-label="泸定桥示意图">
-          <div className="mountain m1"/><div className="mountain m2"/><div className="sun"/>
-          <div className="chain chain-a"/><div className="chain chain-b"/><div className="planks">{Array.from({length: 17}).map((_,i)=><i key={i}/>)}</div>
-          <div className="river">大渡河</div><div className="art-caption">不是为了击杀<br/><b>是为了让大部队通过</b></div>
-        </div>
-      </section>}
-
-      {phase === "briefing" && <section className="mission panel">
-        <div className="stage-label">01 / 战略判断</div>
-        <div className="role-card" style={{ "--role": r.color } as React.CSSProperties}><small>本局随机角色</small><h2>{r.name}</h2><b>{r.tag}</b><p>{r.desc}</p><div>初始弹药 <strong>{r.ammo}</strong></div></div>
-        <div className="decision"><p className="eyebrow">安顺场 · 紧急军情</p><h2>船只有限，大部队无法及时渡河。你建议——</h2>
-          <button onClick={() => chooseRoute(false)}><b>继续在安顺场摆渡</b><span>集中兵力，但预计耗时过长</span></button>
-          <button onClick={() => chooseRoute(true)}><b>分路北进，抢占泸定桥</b><span>争夺关键渡河通道</span></button>
-          {feedback && <div className="feedback">{feedback}</div>}
-        </div>
-      </section>}
-
-      {phase === "march" && <section className="march panel">
-        <div className="stage-label">02 / 昼夜急行</div>
-        <div className="hud"><div><small>剩余行动窗口</small><b>{time}′</b></div><div><small>队伍体力</small><b>{stamina}%</b></div><div><small>行军进度</small><b>{Math.round((marchIndex / 3) * 100)}%</b></div></div>
-        <div className="route"><span>安顺场</span><div className="route-line"><i style={{left:`${12 + marchIndex * 36}%`}}/></div><span>泸定桥</span></div>
-        <div className="event-card"><p className="eyebrow">事件 {marchIndex + 1} / 3</p><h2>{MARCH_EVENTS[marchIndex].title}</h2><p>{MARCH_EVENTS[marchIndex].text}</p>
-          <div className="event-options">{MARCH_EVENTS[marchIndex].options.map((o,i)=><button key={i} onClick={()=>marchChoice(o)} disabled={!!marchNote}><b>{o.label}</b><span>预计耗时 {o.time}′</span></button>)}</div>
-          {marchNote && <div className="feedback">{marchNote}</div>}
-        </div>
-      </section>}
-
-      {phase === "battle" && <section className="battle panel">
-        <div className="battle-hud"><div><small>随机角色</small><b style={{color:r.color}}>{r.name}</b></div><div><small>弹药</small><b>{ammo}</b></div><div><small>桥面推进</small><b>{Math.round(progress)}%</b></div><div><small>增援倒计时</small><b>{battleTime}s</b></div></div>
-        <div className="battlefield">
-          <div className="bank bank-left"><span>火力掩护组</span></div><div className="water-lines"/>
-          <div className="battle-bridge"><div className="bridge-progress" style={{width:`${progress}%`}}/><div className="squad" style={{left:`${Math.min(92, progress)}%`}}>▲</div></div>
-          <div className="bank bank-right"><span>泸定桥东岸</span></div>
-          {enemies.map(e=><button key={e.id} className={`enemy ${e.type}`} style={{left:`${e.x}%`,top:`${e.y}%`}} onClick={()=>shoot(e.id)} aria-label={e.type === "nest" ? "敌方火力点" : "敌军"}><i/><small>{e.type === "nest" ? "火力点" : "守军"}</small></button>)}
-          <div className="crosshair">＋</div>
-        </div>
-        <div className="battle-tip"><b>{r.tag}</b><span>{role === "gunner" ? "连续点击目标保持压制；弹量优势会加快队伍推进。" : role === "assault" ? "快速清除近桥目标；越过桥中段后推进加速。" : "优先点击方形火力点；你的单发伤害最高。"}</span></div>
-      </section>}
-
-      {phase === "quiz" && <section className="quiz panel">
-        <div className="stage-label">04 / 战后复盘</div><p className="eyebrow">知识检验 {quizIndex+1} / {QUESTIONS.length}</p><h2>{QUESTIONS[quizIndex].q}</h2>
-        <div className="quiz-choices">{QUESTIONS[quizIndex].choices.map((c,i)=><button key={c} onClick={()=>answer(i)} disabled={!!feedback}><span>{String.fromCharCode(65+i)}</span>{c}</button>)}</div>
-        {feedback && <div className="feedback">{feedback}</div>}
-      </section>}
-
-      {phase === "result" && <section className="result panel">
-        <p className="eyebrow">任务完成 · 战后报告</p><h1>{progress >= 100 ? "生命通道已经打开" : "突击队抵达东岸"}</h1>
-        <p className="result-lead">夺取泸定桥不是一个人的冲锋，而是情报、速度、火力掩护、突击与后续保障共同完成的行动。</p>
-        <div className="score-grid"><div><b>{r.name}</b><small>随机角色</small></div><div><b>{hits}</b><small>清除威胁</small></div><div><b>{Math.round(progress)}%</b><small>桥面推进</small></div><div><b>{quizScore}/{QUESTIONS.length}</b><small>知识掌握</small></div></div>
-        <div className="history-note"><b>你应该记住</b><p>1935年5月29日，红四团经过昼夜急行抵达泸定桥。22名突击队员在火力掩护下攀越铁索，后续队伍铺设桥板、控制桥头，为中央红军继续北上打开通道。</p></div>
-        <button className="primary" onClick={resetGame}>重新随机角色</button>
-      </section>}
-      <footer><span>基于飞夺泸定桥历史事件设计</span><span>学习目标：地理 · 历史 · 协同决策</span></footer>
-    </main>
-  );
+export default function Home(){
+  const [phase,setPhase]=useState<Phase>("intro");const [player,setPlayer]=useState<Vec>({x:0,z:10});const [boards,setBoards]=useState(0);const [health,setHealth]=useState(5);const [warning,setWarning]=useState<Vec|null>(null);const [enemyAlive,setEnemyAlive]=useState(Array(15).fill(true));const [laying,setLaying]=useState(false);const [cooldown,setCooldown]=useState(0);const [shotFlash,setShotFlash]=useState(0);const [scoutReady,setScoutReady]=useState(false);const [feedback,setFeedback]=useState("");const [torch,setTorch]=useState<boolean|null>(null);const [routeChoice,setRouteChoice]=useState("");const [quizStep,setQuizStep]=useState(0);const [escapePlayer,setEscapePlayer]=useState<Vec>({x:0,z:0});const [pursuers,setPursuers]=useState<Vec[]>(()=>ESCAPE_PURSUER_START.map(p=>({...p})));const [alert,setAlert]=useState(0);const [stealth,setStealth]=useState(false);const [decoys,setDecoys]=useState(2);const [decoy,setDecoy]=useState<Vec|null>(null);const lastEscapeHit=useRef(0);const [music,setMusic]=useState(true);const audio=useRef<{stop:()=>void}|null>(null);const keys=useRef(new Set<string>());const state=useRef({phase,player,boards,health,warning,enemyAlive,laying,cooldown});state.current={phase,player,boards,health,warning,enemyAlive,laying,cooldown};const defeated=enemyAlive.filter(v=>!v).length;const enemyFireRate=defeated>=10?5:defeated>=5?3:2;
+  const start=()=>{if(music&&!audio.current)audio.current=makeAudio();setPhase("scout");setTimeout(()=>setScoutReady(true),4200)};
+  const startLevel2=()=>{if(music&&!audio.current)audio.current=makeAudio();setQuizStep(0);setFeedback("");setPhase("level2Intro")};
+  const restart=()=>{setPhase("intro");setPlayer({x:0,z:10});setBoards(0);setHealth(5);setWarning(null);setEnemyAlive(Array(15).fill(true));setLaying(false);setCooldown(0);setScoutReady(false);setFeedback("");setTorch(null);setRouteChoice("")};
+  const toggleMusic=()=>{if(music){audio.current?.stop();audio.current=null}else audio.current=makeAudio();setMusic(!music)};
+  const beginEscape=()=>{setEscapePlayer({x:0,z:0});setPursuers(ESCAPE_PURSUER_START.map(p=>({...p})));setAlert(0);setStealth(false);setDecoys(2);setDecoy(null);lastEscapeHit.current=0;setFeedback("");setPhase("escape")};
+  const shoot=useCallback(()=>{const s=state.current;if(s.phase!=="battle"||s.cooldown>0||s.laying)return;const thresholds=[5,7,8];const alive=s.enemyAlive.map((v,i)=>({v,i,row:Math.floor(i/5),d:Math.hypot(ENEMY_POSITIONS[i].x-s.player.x,ENEMY_POSITIONS[i].z-s.player.z)})).filter(e=>e.v&&s.boards>=thresholds[e.row]).sort((a,b)=>a.d-b.d)[0];if(!alive){const next=s.boards<5?"第1排需铺到第5块桥板":s.boards<7?"第2排需铺到第7块桥板":s.boards<8?"第3排需铺到第8块桥板":"当前射程内没有敌人";setFeedback(next);setTimeout(()=>setFeedback(""),1200);return}setCooldown(8);setShotFlash(Date.now());setEnemyAlive(old=>old.map((v,i)=>i===alive.i?false:v));let remaining=8;const timer=setInterval(()=>{remaining-=1;setCooldown(remaining);if(remaining<=0)clearInterval(timer)},1000)},[]);
+  const layBoard=useCallback(()=>{const s=state.current;if(s.phase!=="battle"||s.laying||s.boards>=BOARD_COUNT)return;const targetZ=BRIDGE_START-s.boards*BOARD_STEP+1.2;if(s.player.z<targetZ-1.5||s.player.z>targetZ+2.8){setFeedback("靠近断桥前沿才能铺板");setTimeout(()=>setFeedback(""),1000);return}setLaying(true);setTimeout(()=>{setBoards(v=>v+1);setLaying(false)},1000)},[]);
+  useEffect(()=>{const down=(e:KeyboardEvent)=>{const k=e.key.toLowerCase();keys.current.add(k);if(["arrowup","arrowdown","arrowleft","arrowright","q","f","e"].includes(k))e.preventDefault();if(k==="e"&&state.current.phase==="scout"&&scoutReady)setPhase("question");if(k==="q"&&state.current.phase==="battle")shoot();if(k==="f"&&state.current.phase==="battle")layBoard();if(k==="f"&&state.current.phase==="escape"&&!e.repeat)setStealth(v=>!v);if(k==="q"&&state.current.phase==="escape"&&!e.repeat)setDecoys(n=>{if(n<=0){setFeedback("假情报已经用完");setTimeout(()=>setFeedback(""),900);return n}setDecoy({x:escapePlayer.x-12,z:escapePlayer.z+10});setTimeout(()=>setDecoy(null),4000);return n-1})};const up=(e:KeyboardEvent)=>keys.current.delete(e.key.toLowerCase());window.addEventListener("keydown",down);window.addEventListener("keyup",up);return()=>{window.removeEventListener("keydown",down);window.removeEventListener("keyup",up)}},[scoutReady,shoot,layBoard,escapePlayer]);
+  useEffect(()=>{if(phase!=="battle")return;const loop=setInterval(()=>{const s=state.current;if(s.laying)return;let dx=0,dz=0;if(keys.current.has("arrowleft"))dx-=.34;if(keys.current.has("arrowright"))dx+=.34;if(keys.current.has("arrowup"))dz-=.34;if(keys.current.has("arrowdown"))dz+=.34;if(!dx&&!dz)return;const front=BRIDGE_START-Math.max(0,s.boards-1)*BOARD_STEP+.35;setPlayer(p=>({x:Math.max(-3.6,Math.min(3.6,p.x+dx)),z:Math.max(front,Math.min(10,p.z+dz))}))},40);return()=>clearInterval(loop)},[phase]);
+  useEffect(()=>{if(phase!=="battle"||defeated===15)return;const cycle=setInterval(()=>{const s=state.current;const point={x:Math.max(-3.5,Math.min(3.5,s.player.x+(Math.random()-.5)*2.4)),z:s.player.z+(Math.random()-.5)*2.4};setWarning(point);setTimeout(()=>{const now=state.current.player;if(Math.hypot(now.x-point.x,now.z-point.z)<1.05){setHealth(h=>{const n=h-1;if(n<=0)setPhase("lost");return Math.max(0,n)})}setWarning(null)},1000)},enemyFireRate*1000);return()=>clearInterval(cycle)},[phase,enemyFireRate,defeated]);
+  useEffect(()=>{if(phase==="battle"&&defeated===15&&player.z<=-21)setPhase("won")},[phase,defeated,player.z]);
+  useEffect(()=>{if(phase!=="escape")return;const loop=setInterval(()=>{const speed=stealth ? 0.18 : 0.32;let dx=0,dz=0;if(keys.current.has("arrowleft"))dx-=speed;if(keys.current.has("arrowright"))dx+=speed;if(keys.current.has("arrowup"))dz-=speed;if(keys.current.has("arrowdown"))dz+=speed;setEscapePlayer(p=>{const next={x:Math.max(-36,Math.min(36,p.x+dx)),z:Math.max(-36,Math.min(36,p.z+dz))};setPursuers(old=>{const nearest=decoy?old.reduce((best,e,i)=>Math.hypot(e.x-decoy.x,e.z-decoy.z)<Math.hypot(old[best].x-decoy.x,old[best].z-decoy.z)?i:best,0):-1;return old.map((e,i)=>{const target=i===nearest&&decoy?decoy:i===2?{x:next.x+(13-next.x)*.28,z:next.z+(-13-next.z)*.28}:i===3?{x:13,z:-13}:next;const ax=target.x-e.x,az=target.z-e.z,len=Math.hypot(ax,az)||1;const pace=[.115,.192,.158,.135][i]*((stealth&&i!==nearest) ? 0.45 : 1);return{x:e.x+ax/len*pace,z:e.z+az/len*pace}})});return next})},40);return()=>clearInterval(loop)},[phase,stealth,decoy]);
+  useEffect(()=>{if(phase!=="escape"||Date.now()-lastEscapeHit.current<1400)return;const hit=pursuers.findIndex(e=>Math.hypot(e.x-escapePlayer.x,e.z-escapePlayer.z)<1.45);if(hit<0)return;lastEscapeHit.current=Date.now();setPursuers(old=>old.map((e,i)=>i===hit?{x:e.x+(e.x-escapePlayer.x)*4,z:e.z+(e.z-escapePlayer.z)*4}:e));setAlert(v=>{const next=v+1;if(next>=3)setPhase("level2Lost");return Math.min(3,next)})},[phase,pursuers,escapePlayer]);
+  useEffect(()=>{const collect=(e:KeyboardEvent)=>{if(e.key.toLowerCase()==="e"&&phase==="escape"){if(Math.hypot(escapePlayer.x-13,escapePlayer.z+13)<2.4)setPhase("level2Won");else{setFeedback("靠近红旗后才能按 E 收集");setTimeout(()=>setFeedback(""),1000)}}};addEventListener("keydown",collect);return()=>removeEventListener("keydown",collect)},[phase,escapePlayer]);
+  useEffect(()=>()=>audio.current?.stop(),[]);
+  return <main className="game"><World3D phase={phase} player={player} boards={boards} warning={warning} enemyAlive={enemyAlive} laying={laying} shotFlash={shotFlash}/>{phase==="escape"&&<EscapeWorld player={escapePlayer} pursuers={pursuers}/>}<div className="grain"/>
+    <header><div className="logo"><b>{["level2Intro","chishuiMap","chishuiQuiz","diversion","escape","level2Won","level2Lost"].includes(phase)?"赤水":"泸定"}</b><span>与时间赛跑 · 3D</span></div><div className="chapter">{["level2Intro","chishuiMap","chishuiQuiz","diversion","escape","level2Won","level2Lost"].includes(phase)?"1935.01—03 · 川滇黔边":"1935.05.29 · 大渡河"}</div><button className="sound" onClick={toggleMusic}>{music?"♫ 配乐开":"配乐关"}</button></header>
+    {phase==="intro"&&<section className="overlay intro level-select"><p className="kicker">历史战术行动 · 选择关卡</p><h1>选择你的<br/><em>历史任务</em></h1><p>两关均可独立体验。你可以从飞夺泸定桥开始，也可以直接进入四渡赤水。</p><div className="level-cards"><button onClick={start}><small>第一关 · 1935年5月</small><b>飞夺泸定桥</b><span>侦察地形、规划路线、铺设桥板并突破守军</span><i>开始第一关 →</i></button><button onClick={startLevel2}><small>第二关 · 1935年1—3月</small><b>四渡赤水</b><span>勾画四渡路线、判断战略意图并跳出包围圈</span><i>直接进入第二关 →</i></button></div></section>}
+    {phase==="scout"&&<section className="scout-ui"><div className="mission-tag">角色 · 侦察兵</div><div className="intel"><h2>观察战场</h2><p>镜头正在巡查大渡河河谷。结合下列情报判断红军下一步行动。</p><ul><li><b>安顺场</b><span>船少，数万人的大部队无法及时摆渡</span></li><li><b>大渡河</b><span>水流湍急，两岸山路崎岖</span></li><li><b>泸定桥</b><span>位于上游，是关键跨河通道</span></li><li><b>敌情</b><span>追兵在后，守军正在拆除桥板</span></li></ul></div><div className={`key-prompt ${scoutReady?"ready":""}`}><kbd>E</kbd><span>{scoutReady?"观察完成，进入判断":"正在接收侦察情报…"}</span></div></section>}
+    {phase==="question"&&<section className="card"><p className="kicker">侦察结论</p><h2>为什么必须迅速夺取泸定桥？</h2><button onClick={()=>{setFeedback("判断正确：接下来在地图上规划路线。");setTimeout(()=>{setFeedback("");setPhase("map")},1300)}}>安顺场运力不足，必须抢占上游通道</button><button onClick={()=>setFeedback("再看地图：真正的压力来自运力、追兵和时间。")}>为了寻找更多敌军进行战斗</button>{feedback&&<p className="feedback">{feedback}</p>}</section>}
+    {phase==="map"&&<RouteMap onComplete={route=>{setRouteChoice(route);setPhase("march")}}/>}
+    {phase==="march"&&<section className="overlay march-ui"><p className="kicker">第二章 · 昼夜急行</p><h2>一昼夜，240里</h2><p>你勾画的路线：<b>{routeChoice}</b>。暴雨、黑夜和崎岖山路都在消耗体力。史实中红四团沿西岸急行，东岸红一师同时牵制增援敌军。</p><div className="march-meter"><i/></div><button onClick={()=>setPhase("torch")}>继续夜行</button></section>}
+    {phase==="torch"&&<section className="card"><p className="kicker">夜间行军决策</p><h2>前方山路漆黑，要不要点火把？</h2><button onClick={()=>{setTorch(false);setFeedback("隐蔽性更好，但山路跌落风险与行军速度都会受影响。");setTimeout(()=>{setPlayer({x:0,z:10});setPhase("battle")},1500)}}>不用火把，保持隐蔽</button><button onClick={()=>{setTorch(true);setFeedback("火把提高速度，也可能暴露位置。需利用天气和对岸火光迷惑敌人。");setTimeout(()=>{setPlayer({x:0,z:10});setPhase("battle")},1500)}}>使用火把，保持队伍速度</button>{feedback&&<p className="feedback">{feedback}</p>}</section>}
+    {phase==="battle"&&<><div className="battle-hud"><div><small>角色</small><b>冲锋兵</b></div><div><small>生命</small><b className="hearts">{"♥".repeat(health)}{"♡".repeat(5-health)}</b></div><div><small>弹药</small><b>∞</b></div><div><small>桥板</small><b>{boards} / {BOARD_COUNT}</b></div><div><small>击倒 / 敌军射击</small><b>{defeated}/15 · {defeated===15?"停止":`${enemyFireRate}s`}</b></div></div><div className="controls"><span><kbd>↑↓←→</kbd> 移动</span><span><kbd>Q</kbd> 自动瞄准射击 {cooldown?`· ${cooldown}s冷却`:""}</span><span><kbd>F</kbd> 铺桥板</span></div><div className="objective"><b>{laying?"正在铺设桥板… 不能移动":defeated===15&&boards<BOARD_COUNT?"守军已全部击倒，继续铺板并前往桥头":defeated<15&&boards===BOARD_COUNT?"桥面已连通，必须击倒全部守军":boards<5?"铺到第5块桥板，进入第一排射程":boards<7?"第一排已进入射程；第7块解锁第二排":boards<8?"前两排已进入射程；第8块解锁第三排":boards<BOARD_COUNT?"三排敌人均已进入射程":"双重目标完成，向对岸桥头前进！"}</b><div><i style={{width:`${((boards/BOARD_COUNT+defeated/15)/2)*100}%`}}/></div><small>过关条件：击倒全部15名守军，并抵达对岸桥头</small><small>射程：第一排 ≥ 5块 · 第二排 ≥ 7块 · 第三排 ≥ 8块</small></div>{warning&&<div className="warning-text">⚠ 红色光柱区域将在 1 秒后遭到射击</div>}{feedback&&<div className="toast">{feedback}</div>}</>}
+    {(phase==="won"||phase==="lost")&&<section className="overlay ending"><p className="kicker">{phase==="won"?"第一关完成":"任务失败"}</p><h1>{phase==="won"?"生命通道已经打开":"倒在桥头"}</h1><p>{phase==="won"?"你击倒了全部15名守军、完成桥面铺设并抵达对岸桥头。下一关：四渡赤水。":"观察红点预警并及时离开射击区域。铺板时无法移动，必须选择安全窗口。"}</p><div className="summary"><span>夜行选择：{torch?"使用火把":"保持隐蔽"}</span><span>守军：{defeated}/15</span><span>桥板：{boards}/20</span><span>生命：{health}/5</span></div><button onClick={()=>phase==="won"?setPhase("level2Intro"):restart()}>{phase==="won"?"进入第二关 · 四渡赤水":"重新开始"}</button></section>}
+    {phase==="level2Intro"&&<section className="overlay intro level2-intro"><p className="kicker">第二关 · 四渡赤水</p><h1>四次渡河<br/><em>调动敌军</em></h1><p>1935年1月末至3月下旬，中央红军在川滇黔边灵活改变方向。你需要读懂四次渡河的先后、地点与战略意图，并从尚未闭合的包围圈中找到缺口。</p><div className="fact-row"><span>土城、元厚一渡</span><span>太平渡、二郎滩二渡与四渡</span><span>茅台三渡</span></div><button onClick={()=>setPhase("chishuiMap")}>打开作战地图</button></section>}
+    {phase==="chishuiMap"&&<ChishuiMap onComplete={()=>{setQuizStep(0);setFeedback("");setPhase("chishuiQuiz")}}/>}
+    {phase==="chishuiQuiz"&&<section className="card strategy-card"><p className="kicker">分段指挥 {quizStep+1} / 4 · {CHISHUI_DECISIONS[quizStep].stage}</p><div className="intel-strip">新情报：{CHISHUI_DECISIONS[quizStep].intel}</div><h2>{CHISHUI_DECISIONS[quizStep].question}</h2><button onClick={()=>setFeedback("判断不利："+CHISHUI_DECISIONS[quizStep].wrong)}>{CHISHUI_DECISIONS[quizStep].wrong}</button><button onClick={()=>{setFeedback("正确："+CHISHUI_DECISIONS[quizStep].explain);setTimeout(()=>{setFeedback("");if(quizStep===2)setPhase("diversion");else if(quizStep===3)beginEscape();else setQuizStep(v=>v+1)},1300)}}>{CHISHUI_DECISIONS[quizStep].correct}</button>{feedback&&<p className="feedback">{feedback}</p>}</section>}
+    {phase==="diversion"&&<DiversionMission onComplete={()=>{setQuizStep(3);setFeedback("");setPhase("chishuiQuiz")}}/>}
+    {phase==="escape"&&<><div className="escape-hud"><p className="kicker">最终任务 · 动态突围</p><b>利用尚未闭合的包围缺口</b><span>川军封锁、滇军快速追击、黔军预判路线、中央军封堵红旗。被截获三次才会失败。</span><div className="alert-meter"><b>警戒值 {alert}/3</b><i>{"●".repeat(alert)}{"○".repeat(3-alert)}</i></div><span>状态：{stealth?"隐蔽中（速度降低，敌军侦察减弱）":"正常行军"} · 假情报 {decoys}/2</span></div><div className="controls"><span><kbd>↑↓←→</kbd> 移动</span><span><kbd>Q</kbd> 投放假情报</span><span><kbd>F</kbd> 切换隐蔽</span><span><kbd>E</kbd> 收集红旗</span></div>{decoy&&<div className="decoy-note">假情报生效：最近敌军被引开 4 秒</div>}{feedback&&<div className="toast">{feedback}</div>}</>}
+    {(phase==="level2Won"||phase==="level2Lost")&&<section className="overlay ending"><p className="kicker">{phase==="level2Won"?"第二关完成":"警戒值已满"}</p><h1>{phase==="level2Won"?"跳出重围":"突围失败"}</h1><p>{phase==="level2Won"?"你先制造假方向调动敌军，再利用隐蔽与假情报穿过部署空隙。四渡赤水的关键不是沿固定路线前进，而是观察敌情、调动敌人并始终争取主动。":"你被敌军连续截获三次。尝试用 Q 引开最近敌军，按 F 隐蔽，并避开正在封堵红旗方向的部队。"}</p><div className="summary"><span>突围警戒：{alert}/3</span><span>剩余假情报：{decoys}/2</span><span>最终状态：{stealth?"隐蔽":"快速行军"}</span></div><button onClick={()=>phase==="level2Won"?restart():beginEscape()}>{phase==="level2Won"?"重新体验两关":"重新突围"}</button></section>}
+  </main>
 }
